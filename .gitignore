@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.buildvenv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# Local app data (never commit a user's chats, models or logs)
+/models/
+/state/
+/chats/
+/logs/
+/workspace/
+/.sideris/
+
+# Installer downloads and build reports
+*.whl
+lc_win.whl
+lc_lin.whl
+selftest.json
+build.log
+pyinstaller.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

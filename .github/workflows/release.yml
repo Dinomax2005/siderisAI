@@ -1,0 +1,482 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update"
+        required: true
+        default: "v5.0.0"
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_VERSION: "0.3.36"
+  APP_VERSION: "5.0.0"
+
+jobs:
+  # ------------------------------------------------------------------------
+  # Unit tests + a real window on Linux (Xvfb)
+  # ------------------------------------------------------------------------
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP:-/tmp}/tests.log"
+          python -m unittest discover -s tests -v 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 2500 "$LOG" | tr '\n' '\r' | sed 's/\r/%0A/g' | sed 's/^/::error::unit test failure tail: /'
+            echo
+            exit "$status"
+          fi
+
+      - name: GUI smoke test (Linux, Xvfb)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a /usr/bin/python3 -c "import sys; sys.path.insert(0, '.'); from sideris_desktop.app import run_gui; raise SystemExit(run_gui(smoke=True))"
+
+      - name: Install screenshot tools (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: sudo apt-get install -y x11-apps imagemagick
+
+      - name: Capture a real screenshot (Linux, Xvfb)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        env:
+          SIDERIS_HOME: ${{ runner.temp }}/ui-home
+        run: |
+          xvfb-run -a -s "-screen 0 1020x700x24" bash -c '
+            /usr/bin/python3 -m sideris_desktop > /tmp/ui.log 2>&1 &
+            pid=$!
+            sleep 8
+            xwd -root -silent | convert xwd:- docs/screenshot.png
+            kill "$pid" || true
+            wait "$pid" || true
+          '
+          file docs/screenshot.png
+
+      - name: Upload UI screenshot
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshot
+          path: docs/screenshot.png
+          if-no-files-found: ignore
+
+      - name: Report test failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const log = path.join(process.env.RUNNER_TEMP || '/tmp', 'tests.log');
+            let tail = '';
+            try {
+              tail = fs.readFileSync(log, 'utf8').slice(-20000);
+            } catch (e) {
+              tail = 'could not read ' + log + ': ' + e;
+            }
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: '### Unit tests failed on ${{ matrix.os }}\n\n```text\n' +
+                    tail.replace(/```/g, '`` `') + '\n```',
+            });
+
+  # ------------------------------------------------------------------------
+  # Build the real installers
+  # ------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+          - os: macos-14
+            artifact: macos
+          - os: ubuntu-22.04
+            artifact: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ------------------------------------------------------------ Windows
+      # Each phase is its own step so a failure names the phase even when
+      # the raw job log is not readable from the automation that watches it.
+      - name: Install build tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed ($LASTEXITCODE)" }
+          python -m pip install pyinstaller .
+          if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller . failed ($LASTEXITCODE)" }
+          # Keep the real wheel filename: pip rejects a wheel renamed to
+          # something without version and platform tags.
+          $Wheel = "llama_cpp_python-$env:LLAMA_VERSION-py3-none-win_amd64.whl"
+          curl.exe -L --fail --retry 3 --retry-delay 2 -o $Wheel "https://github.com/abetlen/llama-cpp-python/releases/download/v$env:LLAMA_VERSION/$Wheel"
+          if ($LASTEXITCODE -ne 0) { throw "llama.cpp wheel download failed ($LASTEXITCODE)" }
+          python -c "import sys, zipfile; bad = zipfile.ZipFile(sys.argv[1]).testzip(); sys.exit(1 if bad else 0)" $Wheel
+          if ($LASTEXITCODE -ne 0) { throw "downloaded llama.cpp wheel is corrupt" }
+          python -m pip install $Wheel 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\build.log" -Append
+          if ($LASTEXITCODE -ne 0) { throw "llama.cpp wheel install failed ($LASTEXITCODE)" }
+          python -c "import llama_cpp; print('llama_cpp', llama_cpp.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "llama.cpp import failed ($LASTEXITCODE)" }
+
+      - name: Build app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          pyinstaller --noconfirm Luno.spec 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\pyinstaller.log"
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            $tail = (Get-Content "$env:RUNNER_TEMP\pyinstaller.log" -Tail 15 -ErrorAction SilentlyContinue | Out-String)
+            Write-Host "::error::PyInstaller failed ($status): $tail"
+            throw "PyInstaller failed ($status)"
+          }
+          if (!(Test-Path "dist\Sideris\Sideris.exe")) { throw "Sideris.exe was not produced" }
+          if (!(Test-Path "dist\Sideris\SiderisCLI.exe")) { throw "SiderisCLI.exe was not produced" }
+          Get-ChildItem dist\Sideris | Select-Object Name, Length
+
+      - name: Verify packaged app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Headless proof that the packed bundle imports Tk, the app and llama.cpp.
+          & "dist\Sideris\SiderisCLI.exe" --selftest "$env:RUNNER_TEMP\selftest.json"
+          if ($LASTEXITCODE -ne 0) { throw "Packaged self-test failed with exit code $LASTEXITCODE" }
+          Get-Content "$env:RUNNER_TEMP\selftest.json"
+
+          # Real window test through the console binary, with a hard time limit
+          # so a modal crash dialog can never hang the runner.
+          $proc = Start-Process -FilePath "dist\Sideris\SiderisCLI.exe" -ArgumentList "--smoke" -PassThru -NoNewWindow
+          if (-not $proc.WaitForExit(180000)) { $proc.Kill(); throw "GUI smoke test timed out" }
+          if ($proc.ExitCode -ne 0) { throw "GUI smoke test failed with exit code $($proc.ExitCode)" }
+
+          # The windowed executable must also boot; it reports through a file
+          # because a windowed build has no stdout.
+          $gui = Start-Process -FilePath "dist\Sideris\Sideris.exe" -ArgumentList "--selftest","$env:RUNNER_TEMP\gui-selftest.json" -PassThru
+          if (-not $gui.WaitForExit(180000)) { $gui.Kill(); throw "Windowed self-test timed out" }
+          if ($gui.ExitCode -ne 0) { throw "Windowed self-test failed with exit code $($gui.ExitCode)" }
+          Get-Content "$env:RUNNER_TEMP\gui-selftest.json"
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed ($LASTEXITCODE)" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\SiderisSetup.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed ($LASTEXITCODE)" }
+          if (!(Test-Path "dist\installer\Sideris-Setup-5.0.0.exe")) { throw "Inno Setup produced no installer" }
+          Get-ChildItem dist\installer
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/installer/*.exe
+          if-no-files-found: error
+
+      # -------------------------------------------------------------- macOS
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP:-/tmp}/build.log"
+          build() {
+            set -euo pipefail
+            python -m pip install --upgrade pip
+            python -m pip install pyinstaller .
+            # The arm64 llama.cpp wheel links libomp; Homebrew provides it.
+            brew install libomp
+            # The upstream 0.3.36 macos arm64 wheel is corrupt at the source
+            # (five identical downloads fail a CRC check), so try the other
+            # published builds and, if none survive verification, compile
+            # llama.cpp locally.  A broken archive must never reach the
+            # installer.
+            WHEEL=""
+            for candidate in \
+              "v${LLAMA_VERSION}/llama_cpp_python-${LLAMA_VERSION}-py3-none-macosx_11_0_arm64.whl" \
+              "v${LLAMA_VERSION}-metal/llama_cpp_python-${LLAMA_VERSION}-py3-none-macosx_11_0_arm64.whl" \
+              "v0.3.35/llama_cpp_python-0.3.35-py3-none-macosx_11_0_arm64.whl" \
+              "v0.3.35-metal/llama_cpp_python-0.3.35-py3-none-macosx_11_0_arm64.whl"; do
+              name="${candidate##*/}"
+              rm -f "$name"
+              if curl -L --fail --retry 3 --retry-delay 2 -o "$name" "https://github.com/abetlen/llama-cpp-python/releases/download/${candidate}" \
+                 && python -c "import sys, zipfile; bad = zipfile.ZipFile(sys.argv[1]).testzip(); sys.exit(1 if bad else 0)" "$name"; then
+                WHEEL="$name"
+                echo "using verified llama.cpp wheel ${candidate}"
+                break
+              fi
+              echo "not usable: ${candidate}"
+            done
+            if [ -n "$WHEEL" ]; then
+              python -m pip install "$WHEEL"
+            else
+              echo "::warning::No prebuilt macOS wheel passed verification; building llama.cpp from source"
+              export CMAKE_ARGS="-DGGML_METAL=on"
+              python -m pip install --no-cache-dir --no-binary=llama-cpp-python "llama-cpp-python==${LLAMA_VERSION}"
+            fi
+            python -c "import llama_cpp; print('llama_cpp', llama_cpp.__version__)"
+          }
+          build 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 1800 "$LOG" | tr '\n' '\r' | sed 's/\r/%0A/g' | sed 's/^/::error::build log tail: /'
+            echo
+            exit "$status"
+          fi
+
+      - name: Build app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP:-/tmp}/pyinstaller.log"
+          pyinstaller --noconfirm Luno.spec 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 1800 "$LOG" | tr '\n' '\r' | sed 's/\r/%0A/g' | sed 's/^/::error::pyinstaller log tail: /'
+            echo
+            exit "$status"
+          fi
+          test -x "./dist/Sideris.app/Contents/MacOS/Sideris"
+          ls -lh dist
+
+      - name: Verify packaged app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./dist/Sideris.app/Contents/MacOS/Sideris --selftest "$PWD/selftest.json"
+          cat selftest.json
+          python -c "import json; report = json.load(open('selftest.json', encoding='utf-8')); assert report['ok'], report; assert report['checks'].get('llama_cpp'), report; assert report['checks'].get('app') == 'imported', report; print('packaged macOS self-test passed')"
+
+      - name: Package app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent dist/Sideris.app "dist/Sideris-${APP_VERSION}-macos-arm64.zip"
+          ls -lh dist
+
+      - name: Upload macOS app
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.zip
+          if-no-files-found: error
+
+      # -------------------------------------------------------------- Linux
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP:-/tmp}/build.log"
+          build() {
+            set -euo pipefail
+            sudo apt-get update
+            # libpython3.10 provides the shared runtime PyInstaller links
+            # against; python3-tk provides the Tk that setup-python lacks.
+            sudo apt-get install -y python3-tk python3-venv libpython3.10 xvfb
+            /usr/bin/python3 --version
+            /usr/bin/python3 -c "import tkinter; print('Tk', tkinter.TkVersion)"
+            /usr/bin/python3 -m venv .buildvenv
+            source .buildvenv/bin/activate
+            python -m pip install --upgrade pip
+            python -m pip install pyinstaller .
+            WHEEL="llama_cpp_python-${LLAMA_VERSION}-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+            downloaded=0
+            for attempt in 1 2 3 4 5; do
+              rm -f "$WHEEL"
+              if curl -L --fail --retry 3 --retry-delay 2 -o "$WHEEL" "https://github.com/abetlen/llama-cpp-python/releases/download/v${LLAMA_VERSION}/${WHEEL}" \
+                 && python -c "import sys, zipfile; bad = zipfile.ZipFile(sys.argv[1]).testzip(); sys.exit(1 if bad else 0)" "$WHEEL"; then
+                downloaded=1
+                break
+              fi
+              echo "llama.cpp wheel download attempt ${attempt} was not a valid wheel; retrying"
+              sleep 3
+            done
+            if [ "$downloaded" -ne 1 ]; then
+              echo "could not download a valid llama.cpp wheel after 5 attempts"
+              exit 1
+            fi
+            python -m pip install "$WHEEL"
+            python -c "import tkinter, llama_cpp; print('Tk', tkinter.TkVersion, 'llama_cpp', llama_cpp.__version__)"
+          }
+          build 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 1800 "$LOG" | tr '\n' '\r' | sed 's/\r/%0A/g' | sed 's/^/::error::build log tail: /'
+            echo
+            exit "$status"
+          fi
+
+      - name: Build app (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="${RUNNER_TEMP:-/tmp}/pyinstaller.log"
+          source .buildvenv/bin/activate
+          pyinstaller --noconfirm Luno.spec 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 1800 "$LOG" | tr '\n' '\r' | sed 's/\r/%0A/g' | sed 's/^/::error::pyinstaller log tail: /'
+            echo
+            exit "$status"
+          fi
+          test -x ./dist/Sideris/SiderisCLI
+          ls -lh dist
+
+      - name: Verify packaged app (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./dist/Sideris/SiderisCLI --selftest selftest.json
+          cat selftest.json
+          python -c "import json; report = json.load(open('selftest.json', encoding='utf-8')); assert report['ok'], report; assert report['checks'].get('llama_cpp'), report; print('packaged Linux self-test passed')"
+          xvfb-run -a ./dist/Sideris/SiderisCLI --smoke
+
+      - name: Package app (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C dist -czf "dist/Sideris-${APP_VERSION}-linux-x86_64.tar.gz" Sideris
+          ls -lh dist
+
+      - name: Upload Linux app
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Report build failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const tmp = process.env.RUNNER_TEMP || '/tmp';
+            let out = '';
+            for (const name of ['build.log', 'pyinstaller.log', 'selftest.json', 'gui-selftest.json']) {
+              const file = path.join(tmp, name);
+              try {
+                out += '\n\n### ' + name + '\n```text\n' +
+                       fs.readFileSync(file, 'utf8').slice(-12000) + '\n```';
+              } catch (e) {
+                out += '\n\n### ' + name + '\n_missing: ' + e.message + '_';
+              }
+            }
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: ('### Build failed on ${{ matrix.os }}' + out).replace(/```\n```/g, '```'),
+            });
+
+  # ------------------------------------------------------------------------
+  # Publish the release
+  # ------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare release layout
+        run: |
+          mkdir -p dist/installer
+          shopt -s nullglob
+          exes=(dist/*.exe)
+          if [ ${#exes[@]} -gt 0 ]; then
+            mv "${exes[@]}" dist/installer/
+          fi
+          find dist -maxdepth 3 -type f -printf '%p  %s bytes\n'
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: Sideris AI Desktop ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          body: |
+            **Sideris AI Desktop 5.0.0** - a private AI assistant that runs entirely on your own computer.
+
+            * Windows: `Sideris-Setup-5.0.0.exe` (per-user install, no admin required)
+            * macOS (Apple silicon): `Sideris-5.0.0-macos-arm64.zip` - unzip, then drag `Sideris.app` to Applications
+            * Linux (x86_64): `Sideris-5.0.0-linux-x86_64.tar.gz` - extract and run `./Sideris/Sideris`
+
+            The packages include the llama.cpp inference runtime; the model itself is
+            downloaded from Hugging Face the first time you run setup, after you grant
+            the download permission. Nothing is sent to any cloud.
+
+            Honest note: Sideris uses small open-weight models (0.5B-14B). Fine-tuning
+            genuinely adapts them to your data, but they are not ChatGPT or Claude and
+            this project does not claim otherwise. Frontier models are trained in data
+            centres at a scale a laptop cannot reproduce.
+
+            Full details: https://github.com/Dinomax2005/siderisAI#readme
+          files: |
+            dist/installer/*.exe
+            dist/*.zip
+            dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
